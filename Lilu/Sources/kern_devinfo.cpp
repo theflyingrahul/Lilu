@@ -256,7 +256,14 @@ void DeviceInfo::grabDevicesFromPciRoot(IORegistryEntry *pciRoot) {
 				awaitPublishing(obj);
 				auto pciiterator = IORegistryIterator::iterateOver(obj, gIODTPlane, kIORegistryIterateRecursively);
 				if (pciiterator) {
-					ExternalVideo v {};
+					// A root bridge may lead to more than one GPU, e.g. when the slots sit behind a PCIe switch
+					// (PLX/Broadcom on workstation boards, multi-GPU risers, Thunderbolt chains).
+					// Collect every GPU and every HDA device under this bridge, then pair them.
+					static constexpr size_t MaxBridgeDevices = 16;
+					IORegistryEntry *videos[MaxBridgeDevices] {};
+					uint32_t vendors[MaxBridgeDevices] {};
+					IORegistryEntry *audios[MaxBridgeDevices] {};
+					size_t videoNum = 0, audioNum = 0;
 					IORegistryEntry *pciobj = nullptr;
 					while ((pciobj = OSDynamicCast(IORegistryEntry, pciiterator->getNextObject())) != nullptr) {
 						uint32_t pcivendor = 0, pcicode = 0;
@@ -279,31 +286,65 @@ void DeviceInfo::grabDevicesFromPciRoot(IORegistryEntry *pciRoot) {
 								}
 								DBGLOG("dev", "found GFX0 device %s at %s by %04X",
 									   safeString(pciobj->getName()), safeString(name),  pcivendor);
-								v.video = pciobj;
-								v.vendor = pcivendor;
+								if (videoNum < MaxBridgeDevices) {
+									videos[videoNum] = pciobj;
+									vendors[videoNum] = pcivendor;
+									videoNum++;
+								} else {
+									SYSLOG("dev", "too many GPUs on pci bridge %s", safeString(name));
+								}
 							} else if (pcicode == WIOKit::ClassCode::HDADevice || pcicode == WIOKit::ClassCode::HDAMmDevice) {
 								DBGLOG("dev", "found audio device %s at %s by %04X",
 									   safeString(pciobj->getName()), safeString(name), pcivendor);
-								v.audio = pciobj;
+								if (audioNum < MaxBridgeDevices) {
+									audios[audioNum++] = pciobj;
+								} else {
+									SYSLOG("dev", "too many audio devices on pci bridge %s", safeString(name));
+								}
 							}
 						}
 					}
 
 					pciiterator->release();
 
-					// AZAL audio devices cannot be descrete GPU devices.
-					// On several AMD platforms there is an IGPU, which makes AZAL be recognised as a descrete GPU/HDA pair.
-					// REF: https://github.com/acidanthera/Lilu/pull/65
-					if (((v.audio && strcmp(v.audio->getName(), "AZAL") != 0) || !v.audio) && v.video) {
-						DBGLOG_COND(v.audio, "dev", "marking audio device as HDAU at %s", safeString(v.audio->getName()));
-						if (!videoExternal.push_back(v))
-							SYSLOG("dev", "failed to push video gpu");
-					} else if (v.audio && !audioBuiltinAnalog && v.audio->getProperty("external-audio") == nullptr) {
+					// Pair each GPU with the audio function sharing its parent, i.e. the same PCI bus and device
+					// (GPU at function 0, HDMI/DP audio at function 1). For a single GPU without such a sibling keep
+					// the historical pairing: the last audio device found under the bridge.
+					IORegistryEntry *lastAudio = audioNum > 0 ? audios[audioNum - 1] : nullptr;
+					for (size_t i = 0; i < videoNum; i++) {
+						ExternalVideo v {};
+						v.video = videos[i];
+						v.vendor = vendors[i];
+						auto videoParent = videos[i]->getParentEntry(gIODTPlane);
+						for (size_t j = 0; j < audioNum; j++) {
+							if (audios[j] != nullptr && audios[j]->getParentEntry(gIODTPlane) == videoParent) {
+								v.audio = audios[j];
+								audios[j] = nullptr;
+								break;
+							}
+						}
+						if (v.audio == nullptr && videoNum == 1)
+							v.audio = lastAudio;
+
+						// AZAL audio devices cannot be descrete GPU devices.
+						// On several AMD platforms there is an IGPU, which makes AZAL be recognised as a descrete GPU/HDA pair.
+						// REF: https://github.com/acidanthera/Lilu/pull/65
+						if ((v.audio && strcmp(v.audio->getName(), "AZAL") != 0) || !v.audio) {
+							DBGLOG_COND(v.audio, "dev", "marking audio device as HDAU at %s", safeString(v.audio->getName()));
+							if (!videoExternal.push_back(v))
+								SYSLOG("dev", "failed to push video gpu");
+						} else if (!audioBuiltinAnalog && v.audio->getProperty("external-audio") == nullptr) {
+							DBGLOG("dev", "marking audio device as HDEF at %s", safeString(v.audio->getName()));
+							audioBuiltinAnalog = v.audio;
+						}
+					}
+
+					if (videoNum == 0 && lastAudio && !audioBuiltinAnalog && lastAudio->getProperty("external-audio") == nullptr) {
 						// On modern AMD platforms or VMware built-in audio devices sits on a PCI bridge just any other device.
 						// On AMD it has a distinct Ryzen device-id for the time being, yet on VMware it is just Intel.
 						// To distinguish the devices we use audio card presence as a marker.
-						DBGLOG("dev", "marking audio device as HDEF at %s", safeString(v.audio->getName()));
-						audioBuiltinAnalog = v.audio;
+						DBGLOG("dev", "marking audio device as HDEF at %s", safeString(lastAudio->getName()));
+						audioBuiltinAnalog = lastAudio;
 					}
 				}
 			}
